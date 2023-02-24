@@ -27,8 +27,10 @@ from typing import (
     Any,
     Callable,
     Iterator,
+    Literal,
     NoReturn,
     Optional,
+    Protocol,
     Sequence,
     Set,
     TypedDict,
@@ -241,14 +243,79 @@ def _run_hub(
     return subprocess.check_output(final_command, text=True, input=stdin).strip()
 
 
-def _graphql(
-    query: str, *, cache: Optional[int] = None, **kwargs: str
-) -> dict[str, Any]:
-    kwargs["query"] = query
-    args = [arg for key, value in kwargs.items() for arg in ("-F", f"{key}={value}")]
-    return typing.cast(
-        dict[str, Any], json.loads(_run_hub(["api", "graphql", *args], cache=cache))
-    )
+def _run_gh(
+    command: list[str], *, cache: Optional[int] = None, stdin: Optional[str] = None
+) -> str:
+    final_command = ("gh",) + tuple(command)
+    if cache and not _CACHE_BUSTER:
+        final_command += ("--cache", str(cache))
+    _xtrace(final_command)
+    return subprocess.check_output(final_command, text=True, input=stdin).strip()
+
+
+class _GithubHelper:
+    _browse_url_option: str
+    _name: str
+    _cache_suffix = ""
+
+    def __hash__(self) -> int:
+        return hash(self._name)
+
+    @staticmethod
+    @functools.cache
+    def from_name(name: Literal["gh", "hub"]) -> "_GithubHelper":
+        return _GhHelper() if name == "gh" else _HubHelper()
+
+    def pull_request(self, *, message: str, head: str, base: str) -> str:
+        raise NotImplementedError()
+
+    # TODO(cyrille): Make this private at some point.
+    # TODO(cyrille): Use tuples rather than lists.
+    def executable(
+        self,
+        command: list[str],
+        *,
+        cache: Optional[int] = None,
+        stdin: Optional[str] = None,
+    ) -> str:
+        final_command = (self._name,) + tuple(command)
+        if cache and not _CACHE_BUSTER:
+            final_command += ("--cache", f"{cache}{self._cache_suffix}")
+        _xtrace(final_command)
+        return subprocess.check_output(final_command, text=True, input=stdin).strip()
+
+    def get_url(self) -> str:
+        return self.executable(["browse", f"-{self._browse_url_option}"])
+
+    def graphql(
+        self,
+        query: str,
+        *,
+        cache: Optional[int] = None,
+        **kwargs: str,
+    ) -> dict[str, Any]:
+        kwargs["query"] = query
+        args = [
+            arg for key, value in kwargs.items() for arg in ("-F", f"{key}={value}")
+        ]
+        return typing.cast(
+            dict[str, Any],
+            json.loads(self.executable(["api", "graphql", *args], cache=cache)),
+        )
+
+
+class _HubHelper(_GithubHelper):
+    _name = "hub"
+    _browse_url_option = "u"
+
+    def pull_request(self, *, message: str, head: str, base: str) -> str:
+        return self.executable(["-m", message, "-h", head, "-b", base])
+
+
+class _GhHelper(_GithubHelper):
+    _name = "gh"
+    _browse_url_option = "n"
+    _cache_suffix = "s"
 
 
 _GithubAPIReference = TypedDict("_GithubAPIReference", {"ref": str})
@@ -269,12 +336,14 @@ class _GithubPullRequest(typing.NamedTuple):
     reviewers: Set[str]
 
     @staticmethod
-    def _fetch_all_pages(per_page: int = 30) -> Iterator[_GithubAPIPullRequest]:
+    def _fetch_all_pages(
+        helper: _GithubHelper, per_page: int = 30
+    ) -> Iterator[_GithubAPIPullRequest]:
         for page in itertools.count(1):
             page_prs = typing.cast(
                 list[_GithubAPIPullRequest],
                 json.loads(
-                    _run_hub(
+                    helper.executable(
                         [
                             "api",
                             rf"/repos/{{owner}}/{{repo}}/pulls?per_page={per_page}&page={page}",
@@ -289,7 +358,7 @@ class _GithubPullRequest(typing.NamedTuple):
 
     @staticmethod
     @functools.lru_cache(maxsize=None)
-    def fetch_all() -> list["_GithubPullRequest"]:
+    def fetch_all(helper: _GithubHelper) -> list["_GithubPullRequest"]:
         """Get all pull requests for the current repository."""
 
         return [
@@ -299,7 +368,7 @@ class _GithubPullRequest(typing.NamedTuple):
                 pr["number"],
                 {rev["login"] for rev in pr["requested_reviewers"]},
             )
-            for pr in _GithubPullRequest._fetch_all_pages()
+            for pr in _GithubPullRequest._fetch_all_pages(helper)
         ]
 
 
@@ -364,6 +433,16 @@ class _GitConfig:
         """Set a config value to git."""
 
         _run_git(["config"] + (["--global"] if is_global else []) + [key, value])
+
+    @property
+    def helper(self) -> _GithubHelper:
+        config_name = self.get_config("review.github.exec") or "hub"
+        if config_name not in ("hub", "gh"):
+            logging.warning(
+                'Github executable "%s" unknown, falling back to "hub"', config_name
+            )
+            config_name = "hub"
+        return _GithubHelper.from_name(config_name)
 
     @property
     def engineers_team_id(self) -> str:
@@ -824,10 +903,13 @@ class _GitlabPlatform(_RemoteGitPlatform):
 class _GithubPlatform(_RemoteGitPlatform):
     _platform = "Github"
 
-    def __init__(self, project_name: str) -> None:
+    def __init__(
+        self, project_name: str, helper: _GithubHelper = _GIT_CONFIG.helper
+    ) -> None:
         super().__init__(project_name)
+        self._helper = helper
         try:
-            _run_hub(["browse", "-u"])
+            helper.get_url()
         except subprocess.CalledProcessError as error:
             raise _ScriptError(
                 "hub tool is not installed, or wrongly configured.\n"
@@ -845,7 +927,7 @@ class _GithubPlatform(_RemoteGitPlatform):
             )
             return set()
         members = json.loads(
-            _run_hub(
+            self._helper.executable(
                 ["api", f"/teams/{_GIT_CONFIG.engineers_team_id}/members"],
                 cache=_ONE_DAY,
             )
@@ -855,7 +937,7 @@ class _GithubPlatform(_RemoteGitPlatform):
     def get_engineers_team_id(self) -> str:
         return str(
             json.loads(
-                _run_hub(
+                self._helper.executable(
                     ["api", f"/orgs/bayesimpact/teams/{_GITHUB_ENG_TEAM_SLUG}"],
                     cache=_ONE_DAY,
                 )
@@ -863,7 +945,7 @@ class _GithubPlatform(_RemoteGitPlatform):
         )
 
     def _add_label(self, issue_number: str, label: str) -> None:
-        _run_hub(
+        self._helper.executable(
             [
                 "api",
                 r"/repos/{owner}/{repo}/issues/" f"{issue_number}/labels",
@@ -882,7 +964,7 @@ class _GithubPlatform(_RemoteGitPlatform):
         assignees = requested_reviewers = set(reviewers)
         if self.engineers:
             requested_reviewers = requested_reviewers & set(self.engineers)
-        _run_hub(
+        self._helper.executable(
             [
                 "api",
                 r"/repos/{owner}/{repo}/pulls/" f"{pull_number}/requested_reviewers",
@@ -891,7 +973,7 @@ class _GithubPlatform(_RemoteGitPlatform):
             ],
             stdin=json.dumps({"reviewers": list(requested_reviewers)}),
         )
-        _run_hub(
+        self._helper.executable(
             [
                 "api",
                 r"/repos/{owner}/{repo}/issues/" f"{pull_number}/assignees",
@@ -909,15 +991,9 @@ class _GithubPlatform(_RemoteGitPlatform):
         if not message:
             self._add_reviewers(refs, reviewers)
             return None
-        hub_command = [
-            "pull-request",
-            "-m",
-            message,
-            "-h",
-            refs.remote,
-            "-b",
-            refs.base,
-        ]
+        hub_command = self._helper.pull_request(
+            message=message, head=refs.remote, base=refs.base
+        )
         if reviewers:
             assignees = requested_reviewers = set(reviewers)
             if self.engineers:
@@ -925,7 +1001,7 @@ class _GithubPlatform(_RemoteGitPlatform):
             hub_command.extend(
                 ["-a", ",".join(assignees), "-r", ",".join(requested_reviewers)]
             )
-        output = _run_hub(hub_command)
+        output = self._helper.executable(hub_command)
         logging.info(
             output.replace("github.com", "reviewable.io/reviews").replace("pull/", "")
         )
@@ -933,7 +1009,9 @@ class _GithubPlatform(_RemoteGitPlatform):
 
     def get_available_reviewers(self) -> Set[str]:
         assignees = json.loads(
-            _run_hub(["api", r"repos/{owner}/{repo}/assignees"], cache=_TEN_MINUTES)
+            self._helper.executable(
+                ["api", r"repos/{owner}/{repo}/assignees"], cache=_TEN_MINUTES
+            )
         )
         return {assignee.get("login", "") for assignee in assignees} - {
             "",
@@ -946,7 +1024,7 @@ class _GithubPlatform(_RemoteGitPlatform):
         return next(
             (
                 str(pr.number)
-                for pr in _GithubPullRequest.fetch_all()
+                for pr in _GithubPullRequest.fetch_all(self._helper)
                 if pr.head == branch
                 if not base or pr.base == base
             ),
@@ -969,12 +1047,12 @@ class _GithubPlatform(_RemoteGitPlatform):
         ]
 
     def _react_with_auto_assign(self, pr_id: str) -> None:
-        pr_node_id = _graphql(
+        pr_node_id = self._helper.graphql(
             _QUERY_GET_PR_INFOS,
             pullRequestUrl=f"https://github.com/{self.project_name}/pull/{pr_id}",
             cache=_ONE_DAY,
         )["data"]["resource"]["id"]
-        _graphql(
+        self._helper.graphql(
             _MUTATION_REACT_COMMENT,
             pullRequestId=pr_node_id,
             reaction=_AUTO_ASSIGN_REACTION,
