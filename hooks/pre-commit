@@ -73,7 +73,7 @@ class _FileParser:
 class _TypescriptParser(_FileParser):
 
     import_regex = re.compile(
-        r"^(import|export)( type)?( \w+,?)?(\s*{([^}]|\n)*})?(\s*from\s*)?'(.*)'$", re.MULTILINE)
+        r"^import( type)?( \w+,?)?(\s*{([^}]|\n)*})?(\s*from\s*)?'(?P<import>.*)'$", re.MULTILINE)
 
     @staticmethod
     @functools.cache
@@ -94,7 +94,7 @@ class _TypescriptParser(_FileParser):
         return module in self.node_default_imports()
 
     def match2module(self, match: Match[str]) -> str:
-        return match.group(6)
+        return match.group('import') or match.group('export')
 
 
 class _PythonParser(_FileParser):
