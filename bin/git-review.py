@@ -232,27 +232,6 @@ def _has_git_diff(base: str) -> bool:
         return True
 
 
-# TODO(cyrille): Use tuples rather than lists.
-def _run_hub(
-    command: list[str], *, cache: Optional[int] = None, stdin: Optional[str] = None
-) -> str:
-    final_command = ["hub"] + command
-    if cache and not _CACHE_BUSTER:
-        final_command.extend(["--cache", str(cache)])
-    _xtrace(final_command)
-    return subprocess.check_output(final_command, text=True, input=stdin).strip()
-
-
-def _run_gh(
-    command: list[str], *, cache: Optional[int] = None, stdin: Optional[str] = None
-) -> str:
-    final_command = ("gh",) + tuple(command)
-    if cache and not _CACHE_BUSTER:
-        final_command += ("--cache", str(cache))
-    _xtrace(final_command)
-    return subprocess.check_output(final_command, text=True, input=stdin).strip()
-
-
 class _GithubHelper:
     _browse_url_option: str
     _name: str
@@ -266,7 +245,9 @@ class _GithubHelper:
     def from_name(name: Literal["gh", "hub"]) -> "_GithubHelper":
         return _GhHelper() if name == "gh" else _HubHelper()
 
-    def pull_request(self, *, message: str, head: str, base: str) -> str:
+    def pull_request(
+        self, *, message: str, head: str, base: str, assignees: str, reviewers: str
+    ) -> str:
         raise NotImplementedError()
 
     # TODO(cyrille): Make this private at some point.
@@ -308,14 +289,55 @@ class _HubHelper(_GithubHelper):
     _name = "hub"
     _browse_url_option = "u"
 
-    def pull_request(self, *, message: str, head: str, base: str) -> str:
-        return self.executable(["-m", message, "-h", head, "-b", base])
+    def pull_request(
+        self, *, message: str, head: str, base: str, assignees: str, reviewers: str
+    ) -> str:
+        return self.executable(
+            [
+                "pull-request",
+                "-m",
+                message,
+                "-h",
+                head,
+                "-b",
+                base,
+                "-a",
+                assignees,
+                "-r",
+                reviewers,
+            ]
+        )
 
 
 class _GhHelper(_GithubHelper):
     _name = "gh"
     _browse_url_option = "n"
     _cache_suffix = "s"
+
+    def pull_request(
+        self, *, message: str, head: str, base: str, assignees: str, reviewers: str
+    ) -> str:
+        body = ""
+        if "\n\n" in message:
+            message, body = message.split("\n\n", 1)
+        return self.executable(
+            [
+                "pr",
+                "create",
+                "-t",
+                message,
+                "-H",
+                head,
+                "-B",
+                base,
+                "-b",
+                body,
+                "-a",
+                assignees,
+                "-r",
+                reviewers,
+            ]
+        )
 
 
 _GithubAPIReference = TypedDict("_GithubAPIReference", {"ref": str})
@@ -457,6 +479,15 @@ class _GitConfig:
     @engineers_team_id.setter
     def engineers_team_id(self, value: str) -> None:
         self.set_config("review.engineers", value)
+
+    @property
+    def organization(self) -> str:
+        """Handle for the current organization. Defaults to bayesimpact"""
+        return self.get_config("review.organization") or "bayesimpact"
+
+    def team(self) -> str:
+        """Handle for the current team in the organization. Defaults to Bayes engineering team."""
+        return self.get_config("review.team") or _GITHUB_ENG_TEAM_SLUG
 
     @property
     def recent_reviewers(self) -> list[str]:
@@ -645,7 +676,7 @@ def _get_best_base_branch(
     """Guess on which branch the changes should be merged."""
 
     remote_branches: Optional[str] = None
-    for sha1 in _run_git(["rev-list", "--max-count=5", branch, "--"]).split("\n")[1:]:
+    for sha1 in _run_git(["rev-list", "--max-count=5", branch]).split("\n")[1:]:
         if remote_branches := _run_git(
             ["branch", "-r", "--contains", sha1, "--list", f"{_REMOTE_REPO}/*"]
         ):
@@ -655,7 +686,7 @@ def _get_best_base_branch(
     if any(rb.endswith(f"/{default}") for rb in remote_branches.split("\n")):
         return None
     for remote_branch in remote_branches.split("\n"):
-        base = remote_branch.rsplit("/", 1)[-1]
+        base = remote_branch.strip().removeprefix(f"{_REMOTE_REPO}/")
         if base != remote:
             return base
     return None
@@ -938,7 +969,10 @@ class _GithubPlatform(_RemoteGitPlatform):
         return str(
             json.loads(
                 self._helper.executable(
-                    ["api", f"/orgs/bayesimpact/teams/{_GITHUB_ENG_TEAM_SLUG}"],
+                    [
+                        "api",
+                        f"/orgs/{_GIT_CONFIG.organization}/teams/{_GIT_CONFIG.team}",
+                    ],
                     cache=_ONE_DAY,
                 )
             )["id"]
@@ -948,7 +982,7 @@ class _GithubPlatform(_RemoteGitPlatform):
         self._helper.executable(
             [
                 "api",
-                r"/repos/{owner}/{repo}/issues/" f"{issue_number}/labels",
+                f"/repos/{{owner}}/{{repo}}/issues/{issue_number}/labels",
                 "--input",
                 "-",
             ],
@@ -967,7 +1001,7 @@ class _GithubPlatform(_RemoteGitPlatform):
         self._helper.executable(
             [
                 "api",
-                r"/repos/{owner}/{repo}/pulls/" f"{pull_number}/requested_reviewers",
+                f"/repos/{{owner}}/{{repo}}/pulls/{pull_number}/requested_reviewers",
                 "--input",
                 "-",
             ],
@@ -976,7 +1010,7 @@ class _GithubPlatform(_RemoteGitPlatform):
         self._helper.executable(
             [
                 "api",
-                r"/repos/{owner}/{repo}/issues/" f"{pull_number}/assignees",
+                f"/repos/{{owner}}/{{repo}}/issues/{pull_number}/assignees",
                 "--input",
                 "-",
             ],
@@ -991,17 +1025,16 @@ class _GithubPlatform(_RemoteGitPlatform):
         if not message:
             self._add_reviewers(refs, reviewers)
             return None
-        hub_command = self._helper.pull_request(
-            message=message, head=refs.remote, base=refs.base
+        assignees = requested_reviewers = set(reviewers)
+        if reviewers and self.engineers:
+            requested_reviewers = requested_reviewers & set(self.engineers)
+        output = self._helper.pull_request(
+            message=message,
+            head=refs.remote,
+            base=refs.base,
+            assignees=",".join(assignees),
+            reviewers=",".join(reviewers),
         )
-        if reviewers:
-            assignees = requested_reviewers = set(reviewers)
-            if self.engineers:
-                requested_reviewers = requested_reviewers & set(self.engineers)
-            hub_command.extend(
-                ["-a", ",".join(assignees), "-r", ",".join(requested_reviewers)]
-            )
-        output = self._helper.executable(hub_command)
         logging.info(
             output.replace("github.com", "reviewable.io/reviews").replace("pull/", "")
         )
