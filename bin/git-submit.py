@@ -81,6 +81,12 @@ def _run_hub(*args: str, cache: Optional[int] = None, silently: bool = False) ->
     _xtrace(final_command)
     return _run(*final_command, silently=silently)
 
+def _run_gh(*args: str, cache: Optional[int] = None, silently: bool = False) -> str:
+    final_command = ("gh",) + args
+    if cache and not _CACHE_BUSTER:
+        final_command += ("--cache", f"{cache}s")
+    _xtrace(final_command)
+    return _run(*final_command, silently=silently)
 
 @functools.cache
 def _can_use_hub() -> bool:
@@ -90,12 +96,37 @@ def _can_use_hub() -> bool:
         return False
 
 
+@functools.cache
+def _can_use_gh() -> bool:
+    try:
+        return bool(shutil.which("gh") and _run_gh("browse", "-n"))
+    except subprocess.CalledProcessError:
+        return False
+
+@functools.cache
+def _can_use_github() -> bool:
+    return _can_use_gh() or _can_use_hub()
+
+
+def _run_github(*args: str, cache: Optional[int] = None, silently: bool = False) -> str:
+    if _can_use_gh():
+        if len(args) >= 2 and args[0] == "browse" and args[1] == "-u":
+            args = ("browse", "-n") + args[2:]
+        if len(args) >= 1 and args[0] == "ci-status":
+            args = args[1:]
+            if len(args) >=2 and args[1] == "-v":
+                args = args[1:]
+            args = ("pr", "checks", "--required") + args
+        return _run_gh(*args, cache=cache, silently=silently)
+    return _run_hub(*args, cache=cache, silently=silently)
+
+
 def _get_auto_merge_status(env: str) -> Optional[bool]:
     """Whether the script should enable auto-merge.
 
     True or False if the script should/shouldn't enable. None if it should ask.
     """
-    if not _can_use_hub():
+    if not _can_use_github():
         return False
     status = os.getenv(env)
     if not status:
@@ -114,15 +145,15 @@ _MUTATION_ENABLE_AUTO_MERGE = """mutation AutoMerge($pullRequestId: ID!) {
     pullRequest {autoMergeRequest {enabledAt}}
   }
 }"""
-_MUTATION_REACT_COMMENT = f"""mutation ReactComment($pullRequestId: ID!, $reaction: String!) {{
-  addComment(input: {{body: $reaction, subjectId: $pullRequestId}}) {{
-    commentEdge {{
-      node {{
+_MUTATION_REACT_COMMENT = """mutation ReactComment($pullRequestId: ID!, $reaction: String!) {
+  addComment(input: {body: $reaction, subjectId: $pullRequestId}) {
+    commentEdge {
+      node {
         id
-      }}
-    }}
-  }}
-}}"""
+      }
+    }
+  }
+}"""
 _MUTATION_DISABLE_AUTO_MERGE = """mutation CancelAutoMerge($pullRequestId: ID!) {
   disablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId}) {
     pullRequest {viewerCanEnableAutoMerge}
@@ -167,7 +198,7 @@ def _graphql(query: str, cache: Optional[int] = None, **kwargs: str) -> dict[str
     kwargs["query"] = query
     args = [arg for key, value in kwargs.items() for arg in ("-F", f"{key}={value}")]
     return typing.cast(
-        dict[str, Any], json.loads(_run_hub("api", "graphql", *args, cache=cache))
+        dict[str, Any], json.loads(_run_github("api", "graphql", *args, cache=cache))
     )
 
 
@@ -272,7 +303,7 @@ def _get_remote_head(base_remote: str) -> str:
     except subprocess.CalledProcessError:
         pass
     if _can_use_hub():
-        head: str = json.loads(_run_hub("api", "repos/{owner}/{repo}", cache=_ONE_DAY))[
+        head: str = json.loads(_run_github("api", "repos/{owner}/{repo}", cache=_ONE_DAY))[
             "default_branch"
         ]
     else:
@@ -442,7 +473,7 @@ def get_pr_info(
         return pr_infos
     logging.warning("The remote branch won't be deleted after auto-merge.")
     if _ask_yes_no("Do you want to update your repository settings?"):
-        _run_hub(
+        _run_github(
             "api",
             "repos/{owner}/{repo}",
             "-X",
@@ -453,14 +484,14 @@ def get_pr_info(
     else:
         logging.info(
             "You can still do it from this page:\n\t%s",
-            _run_hub("browse", "-u", "--", "settings#merge_types_delete_branch"),
+            f"{_run_github('browse', '-u')}settings#merge_types_delete_branch",
         )
     if should_auto_merge and not can_auto_merge:
         logging.warning("The repository is not set to enable auto-merge.")
         if repo_infos["viewerCanAdminister"]:
             logging.info(
                 "You can do it from this page:\n\t%s",
-                _run_hub("browse", "-u", "--", "settings#merge_types_auto_merge"),
+                f"{_run_github('browse', '-u')}settings#merge_types_auto_merge",
             )
         else:
             logging.info("You can contact a repo admin to set it up for you.")
@@ -497,7 +528,7 @@ def _should_auto_merge(
     if not pr_infos:
         return False
     try:
-        _run_hub("ci-status", branch, silently=True)
+        _run_github("ci-status", branch, silently=True)
         return False
     except subprocess.CalledProcessError as error:
         ci_status = error.output
@@ -519,7 +550,7 @@ def _should_auto_merge(
         )
     if not should_auto_merge:
         logging.info('Use "-f" if you want to force submission.')
-        _run_hub("ci-status", "-v", branch)
+        _run_github("ci-status", "-v", branch)
     return should_auto_merge
 
 
@@ -658,7 +689,7 @@ def _merge_now_or_later(pr_infos: _PrInfos, should_auto_merge: bool, sha1: str) 
         return False
     if not should_auto_merge:
         logging.info("Merging on GitHub.")
-        _run_hub(
+        _run_github(
             "api",
             "-X",
             "PUT",
